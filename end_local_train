@@ -1,0 +1,460 @@
+import copy
+import itertools
+from collections import defaultdict, Counter
+
+import math
+import pickle
+import random
+import sys
+from statistics import mean
+import numpy as np
+import pandas as pd
+import torch
+import torch.optim as optim
+import torch.nn as nn
+from GNN import GNN2_caiyang, NGCF, UltraGCN
+from utility.helper import *
+from utility.batch_test import *
+import warnings
+
+from utility.parser import client_args
+
+warnings.filterwarnings('ignore')
+from time import time
+import FileProcess
+import setSeed
+
+
+# =============================================================================
+# Federated Averaging: Standard Parameter Aggregation
+# =============================================================================
+def FedAvg(w):
+    """
+    Perform federated averaging to aggregate model parameters from multiple clients.
+    
+    Args:
+        w: List of state dictionaries from different client models
+        
+    Returns:
+        w_avg: Averaged state dictionary for the global model
+    """
+    # Initialize with deep copy of first client's parameters
+    w_avg = copy.deepcopy(w[0])
+    # Sum parameters from all clients
+    for k in w_avg.keys():
+        for i in range(1, len(w)):
+            w_avg[k] += w[i][k]
+        # Compute arithmetic mean
+        w_avg[k] = torch.div(w_avg[k], len(w))
+    return w_avg
+
+
+# =============================================================================
+# Partial Model Loading: Update Only Shared Embedding Parameters
+# =============================================================================
+def partial_load_global_model(global_model, w_):
+    """
+    Partially load federated-averaged parameters into the global model.
+    Only updates shared embedding matrices while preserving other parameters.
+    
+    Args:
+        global_model: The global model instance to update
+        w_: Dictionary of aggregated parameters from federated averaging
+    """
+    global_state_dict = global_model.state_dict()
+    
+    # Update only shared embedding parameters
+    for key in global_state_dict.keys():
+        if key in w_ and 'embedding_dict' in key:
+            global_state_dict[key].data.copy_(w_[key])
+    
+    # Load updated parameters back to model
+    global_model.load_state_dict(global_state_dict)
+
+
+# =============================================================================
+# Heterogeneous Federated Averaging: Strong vs Weak Client Aggregation
+# =============================================================================
+def federated_averaging(model_strong_para_list, model_weak_para_list):
+    """
+    Perform federated averaging with differentiated treatment for strong/weak clients.
+    - Embedding layers: averaged across ALL clients (strong + weak)
+    - Other layers: averaged only across strong clients (preserving high-quality features)
+    
+    Args:
+        model_strong_para_list: Parameter dictionaries from high-performing clients
+        model_weak_para_list: Parameter dictionaries from low-performing clients
+        
+    Returns:
+        global_model_params: Aggregated parameter dictionary for global model
+    """
+    global_model_params = {}
+    
+    # Get parameter keys (assuming identical model architecture across clients)
+    keys = model_strong_para_list[0].keys()
+    
+    for key in keys:
+        if "embedding" in key:
+            # Embedding layers: aggregate from both strong and weak clients
+            strong_embeddings = [param[key] for param in model_strong_para_list]
+            weak_embeddings = [param[key] for param in model_weak_para_list]
+            all_embeddings = strong_embeddings + weak_embeddings
+            avg_embedding = sum(all_embeddings) / len(all_embeddings)
+            global_model_params[key] = avg_embedding
+        else:
+            # Non-embedding layers: aggregate only from strong clients
+            strong_params = [param[key] for param in model_strong_para_list]
+            avg_param = sum(strong_params) / len(strong_params)
+            global_model_params[key] = avg_param
+    
+    return global_model_params
+
+
+# =============================================================================
+# TF-IDF Weighting: Item Importance Scoring for Neighbor Aggregation
+# =============================================================================
+def TF_IDF_weight(result_dict, user_items, number_nb):
+    """
+    Calculate TF-IDF weights for items in user interaction lists.
+    Prioritizes rare but informative items when aggregating neighbor information.
+    
+    Formula: weight = (1/|user_items|) * log((N+1)/item_frequency)
+    
+    Args:
+        result_dict: Dictionary containing item frequency counts across neighbors
+        user_items: Dictionary mapping users to their interaction item lists
+        number_nb: Number of neighbors considered (for IDF smoothing)
+        
+    Returns:
+        user_items_weight: Dictionary mapping users to list of (item, weight) tuples
+    """
+    user_items_weight = defaultdict(list)
+    
+    for user, items in user_items.items():
+        # Compute TF-IDF scores for each item
+        interaction_counts = np.array(
+            [(1 / len(items)) * np.log((number_nb + 1) / result_dict[item]) for item in items],
+            dtype=float
+        )
+        
+        # Normalize weights to sum to 1 per user
+        sum_values = np.sum(interaction_counts)
+        interaction_counts_normalized = interaction_counts / sum_values
+        
+        # Store weighted (item, weight) pairs
+        for i, item in enumerate(items):
+            weight = interaction_counts_normalized[i]
+            user_items_weight[user].append((item, weight))
+    
+    return dict(user_items_weight)
+
+
+# =============================================================================
+# Model Persistence: Client Model Path Management
+# =============================================================================
+def get_client_model_path(client_id, dataset, model_dir="client_models_"):
+    """
+    Generate hierarchical storage path for client model checkpoints.
+    Organizes models into folders of 1000 clients each for filesystem efficiency.
+    
+    Args:
+        client_id: Unique client identifier
+        dataset: Dataset name for experiment isolation
+        model_dir: Base directory for model storage
+        
+    Returns:
+        Full file path for client model checkpoint (.pkl format)
+    """
+    # Compute folder index (e.g., clients 0-999 → folder "0-999")
+    folder_index = client_id // 1000
+    folder_name = f"{model_dir}{dataset}/{folder_index * 1000}-{(folder_index + 1) * 1000 - 1}/"
+    
+    # Ensure directory exists
+    os.makedirs(folder_name, exist_ok=True)
+    
+    return f"{folder_name}client_{client_id}.pkl"
+
+
+def load_client_model(model, client_id, dataset, device, model_dir):
+    """
+    Load client model checkpoint if available; fallback to initial model otherwise.
+    
+    Args:
+        model: Model instance to load weights into
+        client_id: Client identifier
+        dataset: Dataset name
+        device: Torch device (CPU/GPU)
+        model_dir: Base storage directory
+    """
+    model_path = get_client_model_path(client_id, dataset, model_dir)
+    
+    if os.path.exists(model_path):
+        model.load_state_dict(torch.load(model_path, map_location=device))
+    else:
+        print(f"No saved model found for client {client_id}. Using initial model.")
+
+
+def save_client_model(model, client_id, dataset, model_dir="local_client_models_"):
+    """
+    Save client model parameters to disk with hierarchical organization.
+    
+    Args:
+        model: Model instance to save
+        client_id: Client identifier
+        dataset: Dataset name
+        model_dir: Base storage directory
+    """
+    model_path = get_client_model_path(client_id, dataset, model_dir)
+    torch.save(model.state_dict(), model_path)
+
+
+# =============================================================================
+# Contrastive Loss: Pairwise Embedding Distance Optimization
+# =============================================================================
+def contrastive_loss(embedding1, embedding2, label, margin=1.0):
+    """
+    Compute contrastive loss for pairwise embedding learning.
+    
+    - Positive pairs (label=1): minimize Euclidean distance
+    - Negative pairs (label=0): maximize distance beyond margin
+    
+    Args:
+        embedding1: First embedding tensor [batch_size, embed_dim]
+        embedding2: Second embedding tensor [batch_size, embed_dim]
+        label: Binary tensor indicating pair type (1=positive, 0=negative)
+        margin: Minimum distance threshold for negative pairs
+        
+    Returns:
+        Mean contrastive loss over batch
+    """
+    # Compute L2 distance between embedding pairs
+    distance = torch.norm(embedding1 - embedding2, p=2, dim=1)
+    
+    # Contrastive loss formulation
+    loss = (label * distance.pow(2) + 
+            (1 - label) * torch.clamp(margin - distance, min=0).pow(2))
+    return loss.mean()
+
+
+# =============================================================================
+# Sparse Matrix Conversion: scipy → PyTorch Sparse Tensor
+# =============================================================================
+def _convert_sp_mat_to_sp_tensor(X):
+    """
+    Convert scipy sparse matrix to PyTorch sparse tensor for GPU operations.
+    
+    Args:
+        X: scipy.sparse matrix (e.g., adjacency matrix)
+        
+    Returns:
+        torch.sparse.FloatTensor: Sparse tensor with same structure
+    """
+    coo = X.tocoo()  # Convert to coordinate format
+    i = torch.LongTensor([coo.row, coo.col])  # Extract indices
+    v = torch.from_numpy(coo.data).float()  # Extract values
+    return torch.sparse.FloatTensor(i, v, coo.shape)
+
+
+# =============================================================================
+# Main Execution: Local Model Fine-tuning with Pre-trained Global Initialization
+# =============================================================================
+if __name__ == '__main__':
+    # Set random seed for reproducibility
+    setSeed.init_seed(42)
+    args = parse_args()
+
+    # Configure device and dataset
+    args.device = torch.device('cuda:1')
+    args.dataset = 'yelp_test'
+    
+    # Privacy-preserving configuration
+    args.pi = False           # Enable/disable pseudo-interaction injection
+    args.add_noise = False    # Enable/disable differential privacy noise
+    args.noise = 0.1          # Noise flip ratio
+    args.epsilon = 0.01       # Privacy budget for differential privacy
+    args.pi_number = 0.1      # Pseudo-interaction injection ratio
+    
+    # Initialize data generator
+    data_generator = Data(path=args.data_path + args.dataset, batch_size=args.batch_size, args=args)
+    data_generator.print_statistics()
+    
+    # Generate adjacency matrices for graph convolution
+    plain_adj, norm_adj, mean_adj, adj_mat = data_generator.get_adj_mat_new()
+    
+    # Experiment identifiers
+    gloabl_model_name = 'global_test_yelp_dis'   # Pre-trained global model name
+    algorithm_name = 'local_test_yelp_dis'       # Local fine-tuning experiment name
+    
+    # Training configuration
+    args.mode = 'local'              # Local fine-tuning mode
+    args.negative = 10               # Number of negative samples per positive
+    args.alpha = 0.07                # Temperature coefficient for InfoNCE loss
+    args.epoch = args.negative       # Reuse epoch param for negative sampling config
+    args.local_epoch = args.alpha    # Reuse local_epoch param for temperature config
+    args.layers = 2                  # Number of GNN layers
+    args.embed_size = 64             # Embedding dimension
+    args.lr = 0.001                  # Learning rate
+    args.attention = False           # Enable/disable personalized attention
+    args.number_neb = 5              # Number of similar neighbors to consider
+    
+    # Pre-compute similar users for neighbor-based aggregation
+    t1 = time()
+    similar_users_dict = data_generator.optimized_find_all_similar_users(plain_adj, args.number_neb)
+    t2 = time()
+    print("find_neb_time:", t2 - t1)
+
+    t3 = time()
+    
+    # ========================================================================
+    # Model Initialization: Load Pre-trained Global Model as Starting Point
+    # ========================================================================
+    # Initialize lightweight local model architecture
+    light_model = UltraGCN(
+        data_generator.n_users,
+        data_generator.n_items,
+        norm_adj,
+        plain_adj,
+        args,
+    ).to(args.device)
+    
+    # Load pre-trained global model weights as initialization
+    model_path = os.path.join('model', args.dataset, gloabl_model_name + '.pkl')
+    light_model.load_state_dict(torch.load(model_path, map_location=args.device))
+    
+    # Convert embeddings to layer format for fine-tuning compatibility
+    light_model.convert_embeddings_to_layers()
+    
+    # Evaluate baseline performance before local fine-tuning
+    global_hr10, global_hr20, global_ndcg10, global_ndcg20 = test_model(light_model, data_generator)
+    print(global_hr10, global_hr20, global_ndcg10, global_ndcg20)
+    
+    # ========================================================================
+    # Local Fine-tuning Setup
+    # ========================================================================
+    t0 = time()
+    n_fed_client_each_round = 128  # Clients per federated round (for logging consistency)
+    n_client = data_generator.n_users
+    
+    cur_best_pre_0, stopping_step = 0, 0
+    loss_loger, pre_loger10, pre_loger20, rec_loger10, rec_loger20, \
+        ndcg_loger10, ndcg_loger20, hit_loger10, hit_loger20 = [], [], [], [], [], [], [], [], []
+    best_hr_10, best_hr_20, best_ndcg_10, best_ndcg_20 = 0, 0, 0, 0
+    training_time = 0.0
+
+    begin_time = time()
+    light_local_epoch = 100  # Local fine-tuning epochs per client
+    
+    # Performance logging arrays
+    ndcg_log10, ndcg_log20, hit_log10, hit_log20 = [], [], [], []
+    
+    # ========================================================================
+    # Per-Client Local Fine-tuning Loop
+    # ========================================================================
+    for idx in range(n_client):
+        # Save initial model state for reset after each client's fine-tuning
+        model_ini = copy.deepcopy(light_model.state_dict())
+        
+        # Evaluate baseline performance for this client before fine-tuning
+        hr10_ego, hr20_ego, ndcg10_ego, ndcg20_ego = model_test_one(light_model, data_generator, idx)
+        
+        # Initialize best performance tracking with baseline scores
+        best_hr_10 = hr10_ego
+        best_hr_20 = hr20_ego
+        best_ndcg_10 = ndcg10_ego
+        best_ndcg_20 = ndcg20_ego
+
+        # Initialize loss accumulators
+        light_loss, light_mf_loss, light_emb_loss = 0., 0., 0.
+        
+        # Initialize optimizer for local fine-tuning
+        optimizer = optim.Adam(light_model.parameters(), lr=args.lr)
+        
+        # Local training loop
+        for i in range(light_local_epoch):
+            # Sample mini-batch: target user, positive items, negative items
+            users, pos_items, neg_items = data_generator.local_trainsample(idx, args.negative)
+
+            # Convert samples to GPU tensors
+            users_tensor = torch.tensor(users, dtype=torch.long).to(args.device)
+            pos_tensor = torch.tensor(pos_items, dtype=torch.long).to(args.device)
+            neg_tensor = torch.tensor(neg_items, dtype=torch.long).to(args.device)
+
+            # Forward pass through UltraGCN
+            u_g_embeddings, pos_i_g_embeddings, neg_i_g_embeddings = light_model(
+                users_tensor, pos_tensor, neg_tensor
+            )
+
+            # Compute InfoNCE contrastive loss for recommendation
+            batch_loss, batch_mf_loss, batch_emb_loss = light_model.infoNCE_loss(
+                u_g_embeddings, pos_i_g_embeddings, neg_i_g_embeddings, args.alpha
+            )
+
+            # Backpropagation and parameter update
+            batch_loss.backward()
+            optimizer.step()
+
+            # Accumulate loss metrics
+            light_loss += batch_loss
+            light_mf_loss += batch_mf_loss
+            light_emb_loss += batch_emb_loss
+
+            # Periodic evaluation during fine-tuning
+            if (i % 10 == 0):
+                hr10, hr20, ndcg10, ndcg20 = model_test_one(light_model, data_generator, idx)
+                if hr10 > best_hr_10:
+                    best_hr_10 = hr10
+                    best_hr_20 = hr20
+                    best_ndcg_10 = ndcg10
+                    best_ndcg_20 = ndcg20
+
+        # Log best performance achieved for this client after fine-tuning
+        print(idx, best_hr_10, best_hr_20, best_ndcg_10, best_ndcg_20)
+        hit_loger10.append(best_hr_10)
+        hit_loger20.append(best_hr_20)
+        ndcg_loger10.append(best_ndcg_10)
+        ndcg_loger20.append(best_ndcg_20)
+        
+        # Reset model to initial state for next client's fine-tuning
+        light_model.load_state_dict(model_ini)
+
+    # ========================================================================
+    # Aggregate Results Across All Clients
+    # ========================================================================
+    re_hit_10 = mean(hit_loger10)
+    re_ndcg_10 = mean(ndcg_loger10)
+    re_hit_20 = mean(hit_loger20)
+    re_ndcg_20 = mean(ndcg_loger20)
+
+    final_perf = "Best Iter=[%d]@[%.1f]\thit=[%.5f %.5f], ndcg=[%.5f %.5f]" % \
+                 (idx, time() - t0, re_hit_10, re_hit_20, re_ndcg_10, re_ndcg_20)
+    print(final_perf)
+
+    # ========================================================================
+    # Result Logging and Export
+    # ========================================================================
+    save_dict = data_generator.save_dict()
+    save_dict['algorithm_name'] = algorithm_name
+    save_dict['model'] = args.mode
+    save_dict['HR@10'] = re_hit_10
+    save_dict['HR@20'] = re_hit_20
+    save_dict['NDCG@10'] = re_ndcg_10
+    save_dict['NDCG@20'] = re_ndcg_20
+    save_dict['n_fed_client_each_round'] = n_fed_client_each_round
+    save_dict['GCN_layer'] = args.layers
+    save_dict['lr'] = args.lr
+    save_dict['epoch'] = args.epoch
+    save_dict['dataset'] = args.dataset
+    save_dict['HR@10_list'] = hit_loger10
+    save_dict['HR@20_list'] = hit_loger20
+    save_dict['NDCG@10_list'] = ndcg_loger10
+    save_dict['NDCG@20_list'] = ndcg_loger20
+    save_dict['loss'] = loss_loger
+    save_dict['n_neb'] = args.number_neb
+    save_dict['embedding_size'] = args.embed_size
+    save_dict['noise'] = args.noise
+    save_dict['local_epoch'] = args.local_epoch
+    save_dict['epsilon'] = args.epsilon
+    save_dict['pi_number'] = args.pi_number
+    
+    # Export results to external tracking system
+    FileProcess.add_row_test(save_dict)
